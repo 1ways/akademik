@@ -1,0 +1,42 @@
+using Akademik.DataProvider.Models;
+using Akademik.DataProvider.Repositories;
+
+namespace Akademik.Services.Rooms;
+
+public sealed class RoomService : IRoomService
+{
+	private readonly IRoomRepository _repository;
+
+	public RoomService(IRoomRepository repository)
+	{
+		_repository = repository;
+	}
+		
+	public async ValueTask<PagedResult<Room>> GetAllAsync(Pagination pagination, CancellationToken cancellationToken)
+	{
+		cancellationToken.ThrowIfCancellationRequested();
+		
+		return await _repository.GetAllAsync(pagination, cancellationToken);
+	}
+
+	public async ValueTask<Room?> GetByIdAsync(int id, CancellationToken cancellationToken)
+	{
+		cancellationToken.ThrowIfCancellationRequested();
+		
+		return await _repository.GetByIdAsync(id, cancellationToken);
+	}
+
+	public async ValueTask<Room> CreateAsync(Room room, CancellationToken cancellationToken)
+	{
+		await _repository.CreateAsync(room, cancellationToken);
+
+		return room;
+	}
+
+	public async ValueTask<Room> UpdateAsync(Room room, CancellationToken cancellationToken)
+	{
+		await _repository.UpdateAsync(room, cancellationToken);
+
+		return room;
+	}
+}

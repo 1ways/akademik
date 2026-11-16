@@ -1,0 +1,112 @@
+import logging
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.application.exceptions.exceptions import (
+    ComplaintAlreadyClosed,
+    ComplaintNotFound,
+)
+from src.application.ports.notification_port import NotificationPort
+from src.domain.entities.complaint import ComplaintCreate, ComplaintStatusUpdate
+from src.domain.entities.notification import ADMIN_INBOX_USER_ID
+from src.domain.enums import ComplaintStatus
+from src.infrastructure.database.models.complaint import ComplaintModel
+from src.infrastructure.utils.datetime_utils import utc_now_naive
+
+_ADMIN_ROLES = {"Admin", "ADMIN"}
+
+logger = logging.getLogger(__name__)
+
+
+async def create_complaint(
+    db: AsyncSession,
+    user_id: int,
+    data: ComplaintCreate,
+    notifier: NotificationPort,
+) -> ComplaintModel:
+    complaint = ComplaintModel(
+        user_id=user_id,
+        room_id=data.room_id,
+        content=data.content,
+        is_anonymous=data.is_anonymous,
+        status=ComplaintStatus.NEW,
+    )
+    db.add(complaint)
+    await db.commit()
+    await db.refresh(complaint)
+
+    admin_content = (
+        f"Complaint #{complaint.id} was filed anonymously."
+        if data.is_anonymous
+        else f"Complaint #{complaint.id} was filed by user #{user_id}."
+    )
+    notifications = [(ADMIN_INBOX_USER_ID, "New complaint", admin_content)]
+    if not data.is_anonymous:
+        notifications.insert(
+            0, (user_id, "Complaint registered", "Complaint on review.")
+        )
+
+    for recipient_id, title, content in notifications:
+        try:
+            await notifier.notify(user_id=recipient_id, title=title, content=content)
+        except Exception:
+            # notification failure must not block complaint creation
+            logger.warning("Notification failed", exc_info=True)
+
+    return complaint
+
+
+async def get_complaints(
+    db: AsyncSession,
+    user_id: int,
+    role: str,
+    status_filter: ComplaintStatus | None = None,
+) -> list[ComplaintModel]:
+    stmt = select(ComplaintModel)
+
+    if role not in _ADMIN_ROLES:
+        stmt = stmt.where(ComplaintModel.user_id == user_id)
+
+    if status_filter is not None:
+        stmt = stmt.where(ComplaintModel.status == status_filter)
+
+    stmt = stmt.order_by(ComplaintModel.created_at.desc())
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_complaint_status(
+    db: AsyncSession,
+    complaint_id: int,
+    data: ComplaintStatusUpdate,
+    notifier: NotificationPort,
+) -> ComplaintModel:
+    complaint = await db.get(ComplaintModel, complaint_id)
+    if complaint is None:
+        raise ComplaintNotFound(f"Complaint {complaint_id} not found")
+
+    if complaint.status == ComplaintStatus.CLOSED:
+        raise ComplaintAlreadyClosed(f"Complaint {complaint_id} is already closed")
+
+    old_status = complaint.status
+    complaint.status = data.status
+
+    if data.status == ComplaintStatus.CLOSED:
+        complaint.closed_at = utc_now_naive()
+
+    await db.commit()
+    await db.refresh(complaint)
+
+    if complaint.user_id is not None and not complaint.is_anonymous:
+        try:
+            await notifier.notify(
+                user_id=complaint.user_id,
+                title="Status Changed",
+                content=f"Status Changed: {old_status} → {data.status}.",
+            )
+        except Exception:
+            # notification failure must not block status update
+            logger.warning("Notification failed", exc_info=True)
+
+    return complaint

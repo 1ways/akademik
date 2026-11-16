@@ -1,0 +1,111 @@
+import logging
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.application.exceptions.exceptions import (
+    IssueAlreadyClosed,
+    IssueNotFound,
+)
+from src.application.ports.notification_port import NotificationPort
+from src.domain.entities.issue import IssueCreate, IssueStatusUpdate
+from src.domain.enums import IssueStatus, NotificationChannel
+from src.infrastructure.database.models.issue import IssueModel
+from src.infrastructure.utils.datetime_utils import utc_now_naive
+
+_ADMIN_ROLES = {"Admin", "ADMIN"}
+
+logger = logging.getLogger(__name__)
+
+
+async def create_issue(
+    db: AsyncSession,
+    user_id: int,
+    data: IssueCreate,
+    notifier: NotificationPort,
+) -> IssueModel:
+    issue = IssueModel(
+        user_id=user_id,
+        room_id=data.room_id,
+        title=data.title,
+        description=data.description,
+        priority=data.priority,
+        status=IssueStatus.NEW,
+    )
+    db.add(issue)
+    await db.commit()
+    await db.refresh(issue)
+
+    try:
+        await notifier.notify(
+            user_id=user_id,
+            title="Issue created",
+            content=f'Your issue "{data.title}" has been registered.',
+        )
+    except Exception:
+        # notification failure must not block issue creation
+        logger.warning("Notification failed", exc_info=True)
+
+    return issue
+
+
+async def get_issues(
+    db: AsyncSession,
+    user_id: int,
+    role: str,
+    status_filter: IssueStatus | None = None,
+) -> list[IssueModel]:
+    stmt = select(IssueModel)
+
+    if role not in _ADMIN_ROLES:
+        stmt = stmt.where(IssueModel.user_id == user_id)
+
+    if status_filter is not None:
+        stmt = stmt.where(IssueModel.status == status_filter)
+
+    stmt = stmt.order_by(IssueModel.created_at.desc())
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_issue_status(
+    db: AsyncSession,
+    issue_id: int,
+    data: IssueStatusUpdate,
+    notifier: NotificationPort,
+) -> IssueModel:
+    issue = await db.get(IssueModel, issue_id)
+    if issue is None:
+        raise IssueNotFound(f"Issue {issue_id} not found")
+
+    if issue.status == IssueStatus.CLOSED:
+        raise IssueAlreadyClosed(f"Issue {issue_id} is already closed")
+
+    old_status = issue.status
+    issue.status = data.status
+
+    if data.status == IssueStatus.CLOSED:
+        issue.closed_at = utc_now_naive()
+
+    await db.commit()
+    await db.refresh(issue)
+
+    try:
+        await notifier.notify(
+            user_id=issue.user_id,
+            title="Issue status changed",
+            content=f'The status of your issue "{issue.title}" changed: {old_status} → {data.status}.',
+        )
+
+        if data.status == IssueStatus.CLOSED:
+            await notifier.notify(
+                user_id=issue.user_id,
+                title="Issue closed",
+                content=f'Your issue "{issue.title}" has been closed.',
+                channel=NotificationChannel.EMAIL,
+            )
+    except Exception:
+        # notification failure must not block status update
+        logger.warning("Notification failed", exc_info=True)
+
+    return issue
